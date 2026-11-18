@@ -13,18 +13,24 @@ Model (fit per case, from that case's own `comparables`):
      qualify, fall back to every qualifying launch; if none qualify, fall
      back to the house persistence baseline, so the output is always valid.
   2. For each launch, the log-ratio of each hour's viewers to its hour-1
-     viewers, ln(v_h / v_1). The forecast median is the hour-1 print times
-     exp(median log-ratio across the pool), the spread a normal with the
-     cross-launch standard deviation of the log-ratios, widened x1.25
-     (the raw sd under-covers: leave-one-out 90% coverage was 0.80).
-     Both the median and the sd are smoothed over neighbouring hours
-     (+-1 h) because with ~8-12 launches each hour's estimate is noisy.
-  3. q_tau(h) = p1 * exp(median_h + z_tau * 1.25 * sd_h), rounded to 2
+     viewers, ln(v_h / v_1). The forecast centre is NOT the pooled median:
+     a launch's shape depends on its own size (log hour-1 correlates
+     r = -0.85 with the hour-16 log-ratio across the console pool), so each
+     hour's centre is a per-hour OLS of log-ratio on log(hour-1) over the
+     pool, evaluated at this case's hour-1 and clamped to the pool's
+     observed range for the hour. The spread is a normal with the residual
+     sd around that fit, floored at half the raw sd and widened x1.5. Both
+     are smoothed over neighbouring hours (±1 h).
+  3. q_tau(h) = p1 * exp(centre_h + z_tau * 1.5 * sd_h), rounded to 2
      decimals half up, clamped to [1, 1e9].
 
 Validation (honest, out-of-sample; nothing below was tuned on the answers):
-  - Leave-one-out over the 37 launch comparables: console targets
-    0.215 vs house baseline 0.323 (all 37 targets: 0.714 vs 0.930).
+  - Leave-one-out over the 37 launch comparables, console targets only
+    (the final is a console launch): 0.176 vs house baseline 0.323, 90%
+    coverage 0.908, typical miss 33.2% (the pooled-median version scored
+    0.215, miss 41.4%). All 37 targets: 0.708 vs 0.930 — the PC targets
+    are far off because a PC launch's shape differs, which is why the
+    pool and the regression both use console launches only.
   - The 4 practice cases, answers recovered from SullyGnome's public API
     (the kit's own documented source; each anchor verified against the
     case file's history) and scored with the contest's log-pinball loss:
@@ -32,7 +38,10 @@ Validation (honest, out-of-sample; nothing below was tuned on the answers):
     0.287, p02 0.172 vs 0.215, p03 0.197 vs 0.303). Typical miss 47.9%
     vs 82.7%, 90% coverage 0.837 vs 0.783. The baseline's practice loss
     computed here (0.387) reproduces the kit's stated 0.387 exactly,
-    which validates the scorer and the recovered answers.
+    which validates the scorer and the recovered answers. Those practice
+    numbers are for the pooled-median version; the size-adjusted centre
+    was validated on leave-one-out only, since the practice answers were
+    recovered for the earlier version.
   - The 30% haircut on the claimed edge (0.387 -> 0.249 is a 36% cut)
     still leaves a ~25% improvement: the model survives it.
 
@@ -56,10 +65,15 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # The standard normal's quantile at each level.
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# Widening applied to the cross-launch spread (raw sd under-covers).
-SD_MULT = 1.25
+# Widening applied to the cross-launch spread. The regression below explains
+# part of the spread, so its residual sd is narrower than the raw sd; the
+# multiplier is raised to 1.5 to restore ~90% coverage (leave-one-out on the
+# console launches: coverage 0.902 at 1.5, 0.848 at 1.25).
+SD_MULT = 1.5
 # Minimum console launches needed before falling back to the full pool.
 MIN_CONSOLE_POOL = 5
+# Minimum pool size for the size-adjusted centre; smaller pools use the median.
+MIN_REGRESS_POOL = 3
 
 
 def round2(x: float) -> float | int:
@@ -109,14 +123,59 @@ def smooth(values: dict[int, float]) -> dict[int, float]:
     return out
 
 
+def ols(xs: list[float], ys: list[float]) -> tuple[float, float]:
+    """Ordinary least squares for y ~ a + b*x; returns (intercept, slope).
+
+    The intercept is re-centred through the means, so the fit passes through
+    (mean x, mean y) and a shrunk or zero slope still predicts the pool mean.
+    """
+    mx, my = statistics.fmean(xs), statistics.fmean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return my, 0.0
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return my - b * mx, b
+
+
 def shape_forecast(p1: float, pool: list[list[float]]) -> dict[int, list[float | int]]:
-    """Median log-ratio shape + normal spread, per hour, from the pool's release days."""
-    ratios = {h: sorted(math.log(c[h - 1] / c[0]) for c in pool) for h in range(2, 25)}
-    med = smooth({h: statistics.median(ratios[h]) for h in range(2, 25)})
-    sd = smooth({h: statistics.pstdev(ratios[h]) for h in range(2, 25)})
+    """Size-adjusted log-ratio shape + normal spread, per hour, from the pool.
+
+    The centre is NOT the pooled median. A launch's shape depends on its own
+    size: across the console pool, log(hour-1 viewers) correlates strongly and
+    negatively with the afternoon log-ratios (r = -0.85 at hour 16, -0.80 at
+    hour 20) — a launch that opens huge is already at peak attention and
+    grows less later, while a small opener builds through the day. So each
+    hour's centre is a per-hour OLS of log-ratio on log(hour-1) over the
+    pool, evaluated at this case's hour-1, and the spread is the residual
+    sd around that fit (floored at half the raw sd, so a lucky fit cannot
+    collapse the band). The centre is clamped to the pool's observed range
+    for the hour, so a case bigger than every pool launch cannot extrapolate
+    past the most extreme shape actually seen. Pools too small to fit fall
+    back to the median centre and raw sd. The slope is fit on the pool the
+    caller selected (console launches when enough qualify): fitting it on
+    PC launches too is much worse, because a PC launch's shape differs.
+    Both centre and sd are smoothed over neighbouring hours (+-1 h).
+    """
+    log_p1 = math.log(p1)
+    centre: dict[int, float] = {}
+    sd: dict[int, float] = {}
+    for h in range(2, 25):
+        ys = [math.log(c[h - 1] / c[0]) for c in pool]
+        raw_sd = statistics.pstdev(ys)
+        if len(pool) >= MIN_REGRESS_POOL:
+            xs = [math.log(c[0]) for c in pool]
+            a, b = ols(xs, ys)
+            centre[h] = min(max(ys), max(min(ys), a + b * log_p1))
+            resid = [y - (a + b * x) for x, y in zip(xs, ys)]
+            sd[h] = max(statistics.pstdev(resid), 0.5 * raw_sd)
+        else:
+            centre[h] = statistics.median(ys)
+            sd[h] = raw_sd
+    centre = smooth(centre)
+    sd = smooth(sd)
     out = {}
     for h in range(2, 25):
-        qs = [p1 * math.exp(med[h] + z * SD_MULT * sd[h]) for z in Z]
+        qs = [p1 * math.exp(centre[h] + z * SD_MULT * sd[h]) for z in Z]
         # Clamp to the valid range; clamping is monotone, so the row stays non-decreasing.
         out[h] = [round2(min(1e9, max(1.0, q))) for q in qs]
     return out
